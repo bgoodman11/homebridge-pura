@@ -4,36 +4,203 @@
  */
 
 import { Logging } from 'homebridge';
-import { 
-  CognitoUserPool, 
-  CognitoUser, 
-  AuthenticationDetails,
-  CognitoUserSession,
-} from 'amazon-cognito-identity-js';
 import fetch, { RequestInit } from 'node-fetch';
 import { PuraDevice, PuraAuthTokens } from './puraTypes.js';
+import { PuraCognitoClient } from './puraCognitoClient.js';
 
 // Constants from pypura
-const USER_POOL_ID = 'us-east-1_LaB718hYv'; // Base64 decoded from pypura
-const CLIENT_ID = '4ie4kbat0jb5iljfbaalsiqf9j'; // Base64 decoded from pypura
+const USER_POOL_ID = 'us-east-1_LaB718hYv'; // Currently unused but kept for reference
+const CLIENT_ID = '4ie4kbat0jb5iljfbaalsiqf9j'; // ClientId for the Pura user pool
+const REGION = 'us-east-1'; // inferred from the user pool ID
 const BASE_URL = 'https://trypura.io/mobile/api/';
 
 export class PuraApi {
-  private userPool: CognitoUserPool;
-  private cognitoUser: CognitoUser | null = null;
-  private session: CognitoUserSession | null = null;
+  private tokens: PuraAuthTokens | null = null;
   private readonly log: Logging;
+  private readonly cognito: PuraCognitoClient;
 
   constructor(log: Logging) {
     this.log = log;
-    this.userPool = new CognitoUserPool({
-      UserPoolId: USER_POOL_ID,
-      ClientId: CLIENT_ID,
+    this.cognito = new PuraCognitoClient({
+      region: REGION,
+      clientId: CLIENT_ID,
+      log: this.log,
     });
   }
 
   /**
    * Authenticate with Pura API
+   */
+  async authenticate(username: string, password: string): Promise<PuraAuthTokens> {
+    try {
+      const tokens = await this.cognito.login(username, password);
+      this.tokens = tokens;
+      this.log.debug('Pura authentication successful');
+      return tokens;
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      this.log.error('Pura authentication failed:', msg);
+      throw new Error(`Pura authentication failed: ${msg}`);
+    }
+  }
+
+  /**
+   * Refresh authentication tokens
+   */
+  async refreshToken(): Promise<PuraAuthTokens> {
+    if (!this.tokens?.refreshToken) {
+      throw new Error('Not authenticated: no refresh token');
+    }
+
+    try {
+      const tokens = await this.cognito.refresh(this.tokens.refreshToken);
+      this.tokens = tokens;
+      this.log.debug('Pura token refresh successful');
+      return tokens;
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      this.log.error('Token refresh failed:', msg);
+      throw new Error(`Token refresh failed: ${msg}`);
+    }
+  }
+
+  /**
+   * Get authorization header for API requests
+   */
+  private getAuthHeader(): string {
+    if (!this.tokens?.idToken) {
+      throw new Error('Not authenticated');
+    }
+    return `Bearer ${this.tokens.idToken}`;
+  }
+
+  /**
+   * Make authenticated API request
+   */
+  private async makeRequest(
+    method: string,
+    endpoint: string,
+    data?: unknown,
+  ): Promise<unknown> {
+    const url = new URL(endpoint, BASE_URL).toString();
+
+    const options: RequestInit = {
+      method: method.toUpperCase(),
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: this.getAuthHeader(),
+      },
+    };
+
+    if (data && method.toLowerCase() !== 'get') {
+      options.body = JSON.stringify(data);
+    }
+
+    this.log.debug(`Making ${method} request to ${url}`);
+
+    try {
+      const response = await fetch(url, options);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        this.log.error(`API request failed: ${response.status} - ${errorText}`);
+        throw new Error(`API request failed: ${response.status} - ${errorText}`);
+      }
+
+      const result = await response.json();
+      this.log.debug('API response:', result);
+      return result;
+    } catch (error) {
+      this.log.error('API request error:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all devices
+   */
+  async getDevices(): Promise<PuraDevice[]> {
+    try {
+      const response = await this.makeRequest('GET', 'v2/users/devices') as { devices?: PuraDevice[] };
+      return response.devices || [];
+    } catch (error) {
+      this.log.error('Failed to get devices:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Set device intensity
+   */
+  async setIntensity(deviceId: string, bay: number, intensity: number): Promise<boolean> {
+    try {
+      const response = await this.makeRequest('POST', `devices/${deviceId}/intensity`, {
+        bay,
+        controller: 'mobile',
+        intensity,
+      }) as { success?: boolean };
+      return response.success === true;
+    } catch (error) {
+      this.log.error(`Failed to set intensity for device ${deviceId}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Set always on mode
+   */
+  async setAlwaysOn(deviceId: string, bay: number): Promise<boolean> {
+    try {
+      const response = await this.makeRequest('POST', `devices/${deviceId}/always-on`, {
+        bay,
+      }) as { success?: boolean };
+      return response.success === true;
+    } catch (error) {
+      this.log.error(`Failed to set always on for device ${deviceId}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Stop all diffusion
+   */
+  async stopAll(deviceId: string): Promise<boolean> {
+    try {
+      const response = await this.makeRequest('POST', `devices/${deviceId}/stop-all`) as { success?: boolean };
+      return response.success === true;
+    } catch (error) {
+      this.log.error(`Failed to stop all for device ${deviceId}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Set timer
+   */
+  async setTimer(
+    deviceId: string,
+    bay: number,
+    intensity: number,
+    durationMinutes: number,
+  ): Promise<boolean> {
+    try {
+      const start = Math.floor(Date.now() / 1000);
+      const end = start + (durationMinutes * 60);
+
+      const response = await this.makeRequest('POST', `devices/${deviceId}/timer`, {
+        bay,
+        intensity,
+        start,
+        end,
+        validateOverride: true,
+      }) as { success?: boolean };
+      return response.success === true;
+    } catch (error) {
+      this.log.error(`Failed to set timer for device ${deviceId}:`, error);
+      return false;
+    }
+  }
+}
    */
   async authenticate(username: string, password: string): Promise<PuraAuthTokens> {
     return new Promise((resolve, reject) => {
